@@ -37,37 +37,77 @@ scored -33.68 practice / -38.54 rolling; the occupancy reading alone, capped
 the same way, scored -33.64 / -37.97.  The rmarg weight is therefore zero and
 `_rmarg_probs` is kept below only as the record of that comparison.
 
+Momentum
+--------
+Before the cap is applied, each game's projected mass is scaled by
+exp(k * z), where z is the z-score of its log-playing slope over the last
+`MOMENTUM_BACK` reads, taken against the pool's own mean and spread.  A game
+whose player count is climbing faster than the games it is competing with is
+scaled up across every place; one that is falling is scaled down.
+
+This is a level tilt, and it is deliberately not the rank shift that was tried
+and rejected earlier: it never moves a game between places, it only says how
+much of the window it should be expected to hold.  That distinction matters.
+Shifting the rank a game is queried at made the practice score worse, because
+it fought the transition model on its own ground; scaling the mass leaves the
+transition alone and adds a second opinion about how much of the window a game
+should be expected to hold.
+
+The slope is fitted by least squares over the reads a game actually appears in,
+so a game that misses a read is not penalised for the gap, and a game with
+fewer than two points to fit sits at z = 0, in the middle of the pool, rather
+than being guessed at.  Scoring against the pool's own spread rather than an
+absolute rate is what makes it portable: the chart's player counts drift by
+orders of magnitude between games, and only the comparison within the pool
+carries signal.
+
 Capping
 -------
-Each place's named mass is capped at 0.75, and this is where most of the gain
-over v1 lives.  The occupancy reading uncapped scores -33.59 practice and
+Each place's named mass is capped at 0.70, and capping is where most of the
+gain over v1 lives.  The occupancy reading uncapped scores -33.59 practice and
 -39.85 rolling, only +0.15 over v1 there; capped at 0.75 the same reading
-scores -33.64 and -37.97, so the cap is worth about +1.9 on the rolling
-backtest by itself.  A place's leftover is shared equally by every game on
-that read's chart that the forecast did not name there -- it is the share held
-by games that are not on the chart yet -- and a place whose named mass reaches
-1.0 leaves nothing for them, so every one of those misses is punished at the
-score floor, ln(0.0001).  Holding a quarter of every place back is what buys
-the improvement.
+scores -33.64 and -37.97, so the cap alone is worth about +1.9 on the rolling
+backtest.  A place's leftover is shared equally by every game on that read's
+chart that the forecast did not name there -- it is the share held by games
+that are not on the chart yet -- and a place whose named mass reaches 1.0
+leaves nothing for them, so every one of those misses is punished at the score
+floor, ln(0.0001).  Holding part of every place back is what buys the
+improvement.
+
+The cap came down from 0.75 to 0.70 when the tilt went in, and the two are
+linked: the tilt concentrates mass on the games that are climbing, which makes
+the forecast sharper, and a sharper forecast needs more of each place held back
+for the games that join the chart during the window.  Measured separately the
+tilt wants the cap lower and the practice score wants it higher, and 0.70 is
+where both still beat what came before.
 
 Measured (train on the 34 history reads, score the 10 archive reads in the 72
-hours after the close; rolling backtest over cuts 6, 9, 12, 15, 18 and 21):
+hours after the close; rolling backtest over cuts 6, 9, 12, 15, 18 and 21, and
+again over every cut from 8 to 32 -- 25 folds, 230 scored reads):
 
     reading                              practice    rolling
     v1 (the submitted entry)              -36.87      -40.00
     house persistence baseline            -43.51         --
     occupancy + transition, uncapped      -33.59      -39.85
-    occupancy + transition, capped        -33.64      -37.97
+    occupancy + transition, capped 0.75   -33.64      -37.97
     rank marginal, capped                 -33.75      -39.60
     the 0.6/0.4 blend, capped             -33.68      -38.54
-    this model (capped occupancy)         -33.64      -37.97
+    v2: capped occupancy, cap 0.75        -33.64      -37.97
+    v3: v2 + momentum tilt, cap 0.70      -33.36      -37.70
 
-Rank momentum was tried as a third signal -- a game's recent climb used to
-shift the rank it is queried at -- and it hurt the practice score badly enough
-to be dropped.  So did projecting player counts forward: the chart is computed
+On the denser 25-fold backtest v2 scores -39.16 and v3 -38.82, with v3 ahead
+in 20 of the 25 folds and ahead in both halves of them; v3 also lifts the
+practice top-10 hits from 6.40 to 7.00 and the agreement from 53.50 to 60.30.
+
+Two other ideas were measured and rejected, both because they improved one
+metric while damaging the other.  Rank momentum as a rank shift -- a game's
+recent climb used to move the rank it is queried at -- hurt the practice score
+badly.  Projecting player counts forward did worse still: the chart is computed
 rather than counted, `playing` is the noisiest field in a read, and a ranking
-by extrapolated player count reached 3.5 top-10 hits a read against 5.6 for
-the rank it started from.
+by extrapolated player count reached 3.5 top-10 hits a read against 5.6 for the
+rank it started from.  DRIFT_HORIZON=0.6 looked like a winner on the six-fold
+backtest (+0.04 rolling) but lost on the 25-fold one, which is why the denser
+backtest is quoted alongside it.
 
 The top 10 is chosen by a Hungarian assignment (implemented here in pure
 Python) that maximises the expected top-10 agreement: the reward of putting a
@@ -132,7 +172,17 @@ RMARG_POOL = 16
 # as the record of the comparison and of a reading that was tried.
 BLEND_PROTO = 1.0
 BLEND_RMARG = 0.0
-PLACE_CAP = 0.75
+PLACE_CAP = 0.70
+
+# momentum tilt.  A game whose player count is climbing faster than the rest of
+# the pool is scaled up across every place, and one that is falling is scaled
+# down, before the cap is applied.  This is a level tilt, not the rank shift
+# that was tried and rejected: it never moves a game between places, it only
+# says how much of the window it should be expected to hold.  MOMENTUM_K scales
+# it (0 leaves the model exactly as it was) and MOMENTUM_BACK is how many reads
+# the playing slope is fitted over.
+MOMENTUM_K = 0.20
+MOMENTUM_BACK = 4
 
 
 # ---------------------------------------------------------------- loading
@@ -528,6 +578,67 @@ def choose_top10(probs, candidates, spare=()):
 
 # ------------------------------------------------- reading one: proto
 
+def logp(value):
+    """log(1 + players), so a game with none is not a domain error."""
+    return math.log(value + 1.0)
+
+
+def playing_slope(reads, index, uid, back):
+    """log-playing slope per day over the `back` reads ending at `index`.
+
+    Least squares over the reads the game appears in, so a game that misses a
+    read is not penalised for the gap.  None when there are fewer than two
+    points to fit, which is the honest answer rather than a zero.
+    """
+    games = reads[index][1]
+    if uid not in games or not games[uid][1]:
+        return None
+    points = []
+    for k in range(max(0, index - back), index + 1):
+        chart = reads[k][1]
+        entry = chart.get(uid)
+        if entry is None or not entry[1]:
+            continue
+        hours = (reads[k][0] - reads[index][0]).total_seconds() / 3600.0
+        points.append((hours, logp(entry[1])))
+    if len(points) < 2:
+        return None
+    count = len(points)
+    mean_x = sum(p[0] for p in points) / count
+    mean_y = sum(p[1] for p in points) / count
+    num = sum((p[0] - mean_x) * (p[1] - mean_y) for p in points)
+    den = sum((p[0] - mean_x) ** 2 for p in points)
+    if den <= 0.0:
+        return None
+    return num / den * 24.0
+
+
+def momentum_tilt(reads, pool, back):
+    """universe_id -> z-score of its log-playing slope across the pool.
+
+    Scored against the pool's own mean and spread, so the tilt is about a game
+    rising faster than the games it is competing with, not about an absolute
+    rate.  A game with no slope to fit sits at zero, in the middle.
+    """
+    index = len(reads) - 1
+    values = {}
+    for uid in pool:
+        slope = playing_slope(reads, index, uid, back)
+        if slope is not None:
+            values[uid] = slope
+    if len(values) < 2:
+        return {uid: 0.0 for uid in pool}
+    mean = sum(values.values()) / len(values)
+    var = sum((v - mean) ** 2 for v in values.values()) / len(values)
+    if var <= 0.0:
+        return {uid: 0.0 for uid in pool}
+    spread = math.sqrt(var)
+    out = {uid: 0.0 for uid in pool}
+    for uid, value in values.items():
+        out[uid] = (value - mean) / spread
+    return out
+
+
 def _proto_probs(reads, task):
     """Occupancy projected through the rank transition.
 
@@ -594,6 +705,15 @@ def _proto_probs(reads, task):
             for uid in spool:
                 probs[uid][place] = ((1.0 - SHRINK_WEIGHT) * probs[uid][place]
                                      + SHRINK_WEIGHT * flat)
+
+    if MOMENTUM_K > 0.0:
+        # momentum tilt, applied last so it scales the finished projection
+        tilt = momentum_tilt(reads, pool, MOMENTUM_BACK)
+        for uid in pool:
+            factor = math.exp(MOMENTUM_K * tilt.get(uid, 0.0))
+            row = probs[uid]
+            for place in range(1, PLACES + 1):
+                row[place] *= factor
     return probs
 
 
